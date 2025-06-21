@@ -1,0 +1,131 @@
+#!/usr/bin/env bpftrace
+/*
+ * tcpconnect_extended.bt  Trace TCP connections with extended metrics.
+ *                         For Linux, uses bpftrace and eBPF.
+ *
+ * USAGE: tcpconnect_extended.bt
+ *
+ * This script traces TCP connections and captures additional metrics like duration,
+ * bytes transferred, service, and basic statistics.
+ *
+ * Copyright (c) 2023 [Your Name].
+ * Licensed under the Apache License, Version 2.0.
+ */
+
+#ifndef BPFTRACE_HAVE_BTF
+#include <linux/socket.h>
+#include <net/sock.h>
+#else
+#define AF_INET   2 /* IPv4 */
+#define AF_INET6 10 /* IPv6 */
+#endif
+
+// Structure to hold connection information
+struct ConnInfo {
+    uint64_t start_time;
+    uint64_t src_bytes;
+    uint64_t dst_bytes;
+    uint16_t lport;
+    uint16_t dport;
+    char saddr[40];
+    char daddr[40];
+    uint8_t family;
+};
+
+// Maps for tracking connections and basic stats
+@conn_info[struct sock *]: ConnInfo;        // Per-connection data
+@dst_host_count[char[40]]: uint32_t;        // Active connections per destination host
+@srv_count[uint16_t]: uint32_t;             // Active connections per service (dport)
+
+BEGIN
+{
+    printf("Tracing TCP connections with extended metrics. Hit Ctrl-C to end.\n");
+    printf("%-8s %-6s %-16s %-15s %-6s %-15s %-6s %-8s %-10s %-10s %-8s %-5s %-6s %-6s\n",
+           "TIME", "PID", "COMM", "SADDR", "SPORT", "DADDR", "DPORT", "DURATION", "SRC_BYTES", "DST_BYTES", "SERVICE", "FLAG", "COUNT", "SRV_COUNT");
+}
+
+kprobe:tcp_connect
+{
+    $sk = (struct sock *)arg0;
+    $family = $sk->__sk_common.skc_family;
+    if ($family == AF_INET || $family == AF_INET6) {
+        @conn_info[$sk].start_time = ktime_get_ns();
+        @conn_info[$sk].family = $family;
+        if ($family == AF_INET) {
+            @conn_info[$sk].saddr = ntop($sk->__sk_common.skc_rcv_saddr);
+            @conn_info[$sk].daddr = ntop($sk->__sk_common.skc_daddr);
+        } else {
+            @conn_info[$sk].saddr = ntop($sk->__sk_common.skc_v6_rcv_saddr.in6_u.u6_addr8);
+            @conn_info[$sk].daddr = ntop($sk->__sk_common.skc_v6_daddr.in6_u.u6_addr8);
+        }
+        @conn_info[$sk].lport = $sk->__sk_common.skc_num;
+        @conn_info[$sk].dport = bswap($sk->__sk_common.skc_dport);
+        @conn_info[$sk].src_bytes = 0;
+        @conn_info[$sk].dst_bytes = 0;
+
+        // Increment stats
+        @dst_host_count[@conn_info[$sk].daddr]++;
+        @srv_count[@conn_info[$sk].dport]++;
+    }
+}
+
+kretprobe:tcp_sendmsg
+{
+    $sk = (struct sock *)arg0;
+    if (@conn_info.exists($sk) && retval > 0) {
+        @conn_info[$sk].src_bytes += retval;
+    }
+}
+
+kretprobe:tcp_recvmsg
+{
+    $sk = (struct sock *)arg0;
+    if (@conn_info.exists($sk) && retval > 0) {
+        @conn_info[$sk].dst_bytes += retval;
+    }
+}
+
+kprobe:tcp_close
+{
+    $sk = (struct sock *)arg0;
+    if (@conn_info.exists($sk)) {
+        $duration = (ktime_get_ns() - @conn_info[$sk].start_time) / 1000000; // ms
+        $src_bytes = @conn_info[$sk].src_bytes;
+        $dst_bytes = @conn_info[$sk].dst_bytes;
+        $saddr = @conn_info[$sk].saddr;
+        $daddr = @conn_info[$sk].daddr;
+        $lport = @conn_info[$sk].lport;
+        $dport = @conn_info[$sk].dport;
+        $state = $sk->sk_state;
+
+        // Service mapping
+        $service = "unknown";
+        if ($dport == 80) $service = "http";
+        else if ($dport == 443) $service = "https";
+        else if ($dport == 21) $service = "ftp";
+
+        // Basic stats
+        $count = @dst_host_count[$daddr];
+        $srv_count_val = @srv_count[$dport];
+
+        // Output
+        time("%H:%M:%S ");
+        printf("%-6d %-16s %-15s %-6d %-15s %-6d %-8d %-10d %-10d %-8s %-5d %-6d %-6d\n",
+               pid, comm, $saddr, $lport, $daddr, $dport, $duration, $src_bytes, $dst_bytes,
+               $service, $state, $count, $srv_count_val);
+
+        // Cleanup
+        @dst_host_count[$daddr]--;
+        if (@dst_host_count[$daddr] == 0) delete(@dst_host_count[$daddr]);
+        @srv_count[$dport]--;
+        if (@srv_count[$dport] == 0) delete(@srv_count[$dport]);
+        delete(@conn_info[$sk]);
+    }
+}
+
+END
+{
+    clear(@conn_info);
+    clear(@dst_host_count);
+    clear(@srv_count);
+}
