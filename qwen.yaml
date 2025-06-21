@@ -1,0 +1,5 @@
+model_name_or_path: /home/lab1015/programmes/sjc/newModel/Qwen2.5-7B-Instruct
+adapter_name_or_path: /home/lab1015/programmes/sjc/LLaMA-Factory/saves/Qwen2.5-7B-Instruct/lora/qwen
+template: qwen
+infer_backend: huggingface  # choices: [huggingface, vllm]
+trust_remote_code: true
